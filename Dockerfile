@@ -1,10 +1,18 @@
-FROM node:20-slim
+# Multi-stage: copy the official Local Bot API server binary (tdlib) from
+# the aiogram/telegram-bot-api image — the same image the README uses for
+# local runs. The old approach downloaded a binary from
+# github.com/tdlib/telegram-bot-api/releases, but that repo publishes no
+# releases, so the URL 404'd and the image silently had no binary.
+#
+# The aiogram binary is built for Alpine (musl), so this image must also
+# be Alpine-based (node:20-alpine); it cannot run on Debian-slim (glibc).
+FROM aiogram/telegram-bot-api:latest AS botapi
 
-# telegram-bot-api needs curl + certs to download, and the binary needs no
-# extra runtime deps. Install once, clean up apt lists to keep the image small.
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends curl ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+FROM node:20-alpine
+
+# Runtime deps for the Bot API server binary (openssl, libstdc++) plus
+# curl + certs. Install once; --no-cache keeps the image small.
+RUN apk add --no-cache curl ca-certificates openssl libstdc++
 
 WORKDIR /app
 
@@ -13,23 +21,21 @@ RUN npm install --omit=dev
 
 COPY . .
 
-# Try to install the official Local Bot API server binary (tdlib).
-# If GitHub is unreachable at build time this must NOT fail the build:
-# the app still runs in hosted mode (20 MB getFile limit) and the README
-# explains how to run the local server separately with docker-compose.
-# Pin a known release; `latest/download` is not used on purpose.
-RUN curl -fsSL -o /usr/local/bin/telegram-bot-api \
-      https://github.com/tdlib/telegram-bot-api/releases/download/v8.0/telegram-bot-api \
-  && chmod +x /usr/local/bin/telegram-bot-api \
-  && echo "telegram-bot-api binary installed" \
-  || echo "WARNING: telegram-bot-api binary NOT downloaded — local mode unavailable in this image, hosted mode only. See README."
+# Local Bot API server binary, copied from the aiogram image into the
+# location start.sh expects. Fail the build if it is missing or not
+# executable — local mode (files over 20 MB, up to 4 GB) depends on it.
+COPY --from=botapi /usr/local/bin/telegram-bot-api /usr/local/bin/telegram-bot-api
+RUN chmod +x /usr/local/bin/telegram-bot-api \
+  && test -x /usr/local/bin/telegram-bot-api
 
 RUN mkdir -p /var/lib/telegram-bot-api /tmp/telegram-bot-api-tmp
+
 COPY start.sh ./start.sh
 RUN chmod +x ./start.sh
 
 ENV NODE_ENV=production
 ENV PORT=10000
+
 EXPOSE 10000
 
 CMD ["./start.sh"]
