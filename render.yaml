@@ -1,0 +1,28 @@
+# Render — free web service, Docker. $0/month.
+# After the first deploy, set BASE_URL to the service URL
+# (e.g. https://telegram-downloader-bot.onrender.com) in the Render dashboard.
+services:
+  - type: web
+    name: telegram-downloader-bot
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_BOT_USERNAME
+        sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: BASE_URL
+        sync: false
+      # LOCAL_BOT_API_URL is set by start.sh to http://127.0.0.1:8081
+      # when the local server starts. Do not set it manually on Render.
