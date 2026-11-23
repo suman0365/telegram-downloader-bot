@@ -19,8 +19,10 @@
  *  Without it, hosted api.telegram.org is used and big files will fail
  *  at Telegram's 20 MB getFile limit — that is a Telegram limit, not ours.
  *
- * Hosting: Render free (512 MB RAM). One download at a time, streaming
- * only, no disk storage of files. Keep-alive ping (every 5 min) keeps
+ * Hosting: Render free (512 MB RAM). Up to 3 downloads stream at once
+ * (1 MB chunks, low memory each); extra requests wait on an auto-
+ * refreshing queue page. No disk storage of files. Stalled slots are
+ * force-released by a watchdog. Keep-alive ping (every 5 min) keeps
  * the free service awake, same as FlowFetch.
  */
 
@@ -41,6 +43,14 @@ const MAX_FILE_SIZE = 4294967296; // 4 * 1024 * 1024 * 1024
 const LINK_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const CLEANUP_MS = 10 * 60 * 1000; // every 10 minutes
 const CHUNK_SIZE = 1024 * 1024; // 1 MB stream chunks
+
+// Concurrency: up to 3 downloads stream at once. Streaming is 1 MB
+// chunks, so memory per download stays low — 3 concurrent streams are
+// safe on Render free (512 MB). A 4th request waits in the queue page.
+const MAX_CONCURRENT_DOWNLOADS = 3;
+const STALL_MS = 10 * 60 * 1000; // force-release a slot with no bytes for 10 min
+const MAX_DOWNLOAD_MS = 90 * 60 * 1000; // force-release a slot after 90 min total
+const WATCHDOG_MS = 60 * 1000; // check for stalled slots every minute
 
 function log(...args) {
   console.log(new Date().toISOString(), '[tg-bot]', ...args);
@@ -93,50 +103,151 @@ setInterval(() => {
   if (removed) log(`Cleanup: removed ${removed} expired link(s), ${links.size} active`);
 }, CLEANUP_MS).unref();
 
-// ------------------------------------------------------------- download mutex
-// Render free = 512 MB RAM. Only ONE download streams at a time, so a
-// second browser request gets a friendly "try again" page instead of OOM.
-let downloadInProgress = false;
+// -------------------------------------------------------- download slots
+// Render free = 512 MB RAM. Up to MAX_CONCURRENT_DOWNLOADS downloads
+// stream at once; a request beyond that waits on the queue page and
+// starts automatically when a slot frees up. Every slot is tracked, so
+// a stalled or abandoned download can never hold a slot forever.
+const activeDownloads = new Map(); // id -> { id, fileName, fileSize, startedAt, lastBytesAt, bytesSent, res, stream }
+let downloadSeq = 0;
 
-function pageHtml({ title, heading, lines, buttonText, buttonHref }) {
+// Force-release slots that stopped moving (client gone, upstream stalled)
+// or ran far too long. Destroys the stream/response so the slot really frees.
+function pruneStaleDownloads() {
+  const now = Date.now();
+  for (const [id, slot] of activeDownloads) {
+    const idleMs = now - slot.lastBytesAt;
+    const totalMs = now - slot.startedAt;
+    if (idleMs > STALL_MS || totalMs > MAX_DOWNLOAD_MS) {
+      log(`Download: slot ${id} force-released (idle ${Math.round(idleMs / 1000)}s, total ${Math.round(totalMs / 1000)}s) ${slot.fileName}`);
+      activeDownloads.delete(id);
+      try { if (slot.stream) slot.stream.destroy(); } catch (_) { /* already gone */ }
+      try { if (slot.res) slot.res.destroy(); } catch (_) { /* already gone */ }
+    }
+  }
+}
+
+setInterval(pruneStaleDownloads, WATCHDOG_MS).unref();
+
+// All web pages are ENGLISH ONLY (bot Telegram messages stay
+// Tanglish + English). One shared design: dark gradient, glass card,
+// system fonts only — no external fonts or CDNs, works offline.
+function pageHtml({ title, eyebrow, icon, heading, lines, fileName, fileSize, buttonText, buttonHref, secondaryText, secondaryHref, extraHead, extraBody }) {
   const body = (lines || []).map((l) => `<p>${l}</p>`).join('\n');
+  const fileChip = fileName
+    ? `<div class="file-chip"><span class="file-icon">📄</span><span class="file-meta"><span class="file-name">${escapeHtml(fileName)}</span><span class="file-size">${escapeHtml(formatSize(fileSize))}</span></span></div>`
+    : '';
   const button = buttonHref
     ? `<a class="btn" href="${escapeHtml(buttonHref)}">${escapeHtml(buttonText || 'Open')}</a>`
+    : '';
+  const secondary = secondaryHref
+    ? `<a class="btn btn-ghost" href="${escapeHtml(secondaryHref)}">${escapeHtml(secondaryText || 'Open')}</a>`
     : '';
   return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)}</title>
+${extraHead || ''}
 <style>
-body{background:#0f1115;color:#e8eaf0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:16px}
-.card{background:#1a1d27;border:1px solid #2a2f3f;border-radius:16px;max-width:520px;width:100%;padding:28px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.4)}
-h1{font-size:22px;margin:0 0 12px}.muted{color:#9aa3b2;font-size:14px;line-height:1.6}
-.btn{display:inline-block;margin-top:18px;background:#2ea6ff;color:#fff;text-decoration:none;padding:12px 22px;border-radius:10px;font-weight:600}
-</style></head><body><div class="card"><h1>${escapeHtml(heading)}</h1><div class="muted">${body}</div>${button}</div></body></html>`;
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px 16px;color:#e8eaf0;
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  background:radial-gradient(900px 480px at 15% -10%,rgba(56,130,246,.28),transparent 60%),
+    radial-gradient(800px 480px at 95% 110%,rgba(168,85,247,.20),transparent 60%),
+    linear-gradient(180deg,#0b0e14,#0f1115)}
+.card{width:100%;max-width:560px;text-align:center;padding:36px 30px 28px;border-radius:22px;
+  background:rgba(26,29,39,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  border:1px solid rgba(255,255,255,.09);box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.eyebrow{font-size:11px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:#7dd3fc;margin:0 0 14px}
+.icon{font-size:44px;line-height:1;margin:0 0 14px}
+.icon-float{display:inline-block;animation:bob 2.4s ease-in-out infinite}
+@keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}
+h1{font-size:24px;line-height:1.3;font-weight:700;margin:0 0 12px;letter-spacing:-.01em}
+.muted{color:#aab2c0;font-size:15px;line-height:1.7}
+.muted p{margin:0 0 10px}
+.file-chip{display:flex;align-items:center;gap:12px;text-align:left;margin:18px 0 4px;padding:13px 15px;
+  background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.09);border-radius:14px}
+.file-icon{font-size:22px;flex:none}
+.file-meta{display:flex;flex-direction:column;min-width:0}
+.file-name{font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.file-size{font-size:12px;color:#8b93a5;margin-top:2px}
+.btn{display:inline-block;margin-top:20px;padding:13px 26px;border-radius:12px;font-weight:700;font-size:15px;
+  text-decoration:none;color:#fff;background:linear-gradient(135deg,#38bdf8,#2563eb);
+  box-shadow:0 8px 24px rgba(37,99,235,.35)}
+.btn-ghost{background:transparent;border:1px solid rgba(255,255,255,.22);box-shadow:none;color:#dbe2ee;margin-left:8px}
+.btn-row{margin-top:4px}
+.progress{height:6px;border-radius:99px;overflow:hidden;background:rgba(255,255,255,.09);margin:20px 0 0}
+.progress>div{height:100%;width:40%;border-radius:99px;
+  background:linear-gradient(90deg,#38bdf8,#a78bfa,#38bdf8);background-size:200% 100%;
+  animation:slide 1.6s linear infinite}
+@keyframes slide{0%{background-position:0 0}100%{background-position:200% 0}}
+.countdown{font-weight:700;color:#7dd3fc}
+.footer{margin-top:24px;font-size:12px;color:#6b7280}
+@media (max-width:480px){.card{padding:28px 20px 22px}h1{font-size:21px}.icon{font-size:38px}.btn-ghost{margin-left:0;margin-top:10px}}
+</style></head><body><main class="card">
+${eyebrow ? `<p class="eyebrow">${escapeHtml(eyebrow)}</p>` : ''}
+${icon ? `<div class="icon"><span class="icon-float">${icon}</span></div>` : ''}
+<h1>${escapeHtml(heading)}</h1>
+<div class="muted">${body}</div>
+${fileChip}
+<div class="btn-row">${button}${secondary}</div>
+<p class="footer">Telegram Downloader Bot &middot; Free &middot; Links expire after 24 hours</p>
+</main>${extraBody || ''}</body></html>`;
 }
 
 function expiredPage() {
   const botHref = BOT_USERNAME ? `https://t.me/${BOT_USERNAME}` : 'https://t.me/';
   return pageHtml({
     title: 'Download link expired — Telegram Downloader Bot',
-    heading: '⏰ Download link expired',
+    eyebrow: 'Link expired',
+    icon: '⏰',
+    heading: 'This download link has expired',
     lines: [
-      'Indha link 24 hours ku appuram expire aayiduchu. / This link expired after 24 hours.',
-      'File ah bot ku Telegram la thirumba anuppu, pudhu link kedaikkum. / Send the file to the bot again on Telegram for a fresh link.',
-      'File server la save pannala, adhanala old link ah restore panna mudiyadhu. / The file was never stored on the server, so the old link cannot be restored.',
+      'This link expired 24 hours after it was created.',
+      'Send the file to the bot again on Telegram and you will get a fresh link.',
+      'Files are never stored on this server, so an expired link cannot be restored.',
     ],
     buttonText: 'Open Telegram Bot →',
     buttonHref: botHref,
   });
 }
 
-function busyPage() {
+// Queue page, not a dead end: the page refreshes itself every 15 seconds
+// and starts the download as soon as a slot frees up.
+function queuePage(link, token) {
+  const botHref = BOT_USERNAME ? `https://t.me/${BOT_USERNAME}` : 'https://t.me/';
+  const selfHref = `/dl/${encodeURIComponent(token)}`;
+  return pageHtml({
+    title: 'You are in line — Telegram Downloader Bot',
+    eyebrow: 'In queue',
+    icon: '⏳',
+    heading: 'You are in line',
+    lines: [
+      `All ${MAX_CONCURRENT_DOWNLOADS} download slots are busy right now. Your download will start automatically as soon as a slot frees up — no need to tap anything.`,
+      'Checking again in <span class="countdown" id="countdown">15</span> seconds. Your link stays valid for 24 hours.',
+    ],
+    fileName: link.fileName,
+    fileSize: link.fileSize,
+    buttonText: 'Try now',
+    buttonHref: selfHref,
+    secondaryText: 'Open Telegram Bot →',
+    secondaryHref: botHref,
+    extraHead: `<meta http-equiv="refresh" content="15; url=${escapeHtml(selfHref)}">`,
+    extraBody: `<script>let s=15;const el=document.getElementById('countdown');setInterval(()=>{s--;if(s<=0)s=15;if(el)el.textContent=s;},1000);</script>`,
+  });
+}
+
+function failedPage(err) {
   const botHref = BOT_USERNAME ? `https://t.me/${BOT_USERNAME}` : 'https://t.me/';
   return pageHtml({
-    title: 'One download in progress — Telegram Downloader Bot',
-    heading: '⏳ Oru download nadandhutu irukku',
+    title: 'Download failed — Telegram Downloader Bot',
+    eyebrow: 'Download failed',
+    icon: '❌',
+    heading: 'Download failed',
     lines: [
-      'Free server la oru time la oru download dhaan. / Only one download at a time on the free server.',
-      'Konjam neram kazhichu thirumba try pannunga. Link 24 hours varaikum valid. / Please try again in a little while. Your link stays valid for 24 hours.',
+      'We could not fetch the file from Telegram.',
+      `Reason: ${escapeHtml(err && err.message ? err.message : 'unknown error')}`,
+      'For files over 20 MB, the Local Bot API server must be running. See the README.',
+      'Send the file to the bot again for a fresh link.',
     ],
     buttonText: 'Open Telegram Bot →',
     buttonHref: botHref,
@@ -210,22 +321,37 @@ const app = express();
 app.use(express.json());
 
 app.get('/', (req, res) => {
+  const downloading = [...activeDownloads.values()]
+    .map((s) => `${escapeHtml(s.fileName)} (${formatSize(s.fileSize)})`)
+    .join('<br>');
   res.send(pageHtml({
     title: 'Telegram Downloader Bot — running',
-    heading: '📥 Telegram Downloader Bot',
+    eyebrow: 'Bot is running',
+    icon: '📥',
+    heading: 'Telegram Downloader Bot',
     lines: [
-      'Bot running. / Bot run aagudhu.',
-      'Telegram la file ah bot ku anuppu — browser download link kedaikkum, 24 hours ku valid. / Send a file to the bot on Telegram — you get a browser download link, valid for 24 hours.',
-      `Active links: ${links.size} &nbsp;•&nbsp; Max: Telegram max (free 2GB / Premium 4GB) &nbsp;•&nbsp; Uptime: ${Math.floor(process.uptime())}s`,
+      'Send any file to the bot on Telegram and you will get a browser download link, valid for 24 hours.',
+      `Active links: ${links.size} &nbsp;•&nbsp; Downloads in progress: ${activeDownloads.size} of ${MAX_CONCURRENT_DOWNLOADS} slots &nbsp;•&nbsp; Max: Telegram max (free 2GB / Premium 4GB) &nbsp;•&nbsp; Uptime: ${Math.floor(process.uptime())}s`,
       `Bot: ${BOT_USERNAME ? '@' + BOT_USERNAME : 'not set (TELEGRAM_BOT_USERNAME)'} &nbsp;•&nbsp; Local Bot API: ${LOCAL_BOT_API_URL || 'not set (hosted api.telegram.org, 20 MB getFile limit)'}`,
-    ],
+      downloading ? `Now downloading:<br>${downloading}` : '',
+    ].filter(Boolean),
     buttonText: 'Health check: /health',
     buttonHref: '/health',
   }));
 });
 
 app.get('/health', (req, res) => {
-  res.status(200).json({ ok: true, links: links.size, uptime: Math.floor(process.uptime()) });
+  res.status(200).json({
+    ok: true,
+    links: links.size,
+    uptime: Math.floor(process.uptime()),
+    activeDownloads: [...activeDownloads.values()].map((s) => ({
+      fileName: s.fileName,
+      fileSize: s.fileSize,
+      startedAt: new Date(s.startedAt).toISOString(),
+      bytesSent: s.bytesSent,
+    })),
+  });
 });
 
 app.get('/dl/:token', async (req, res) => {
@@ -236,16 +362,37 @@ app.get('/dl/:token', async (req, res) => {
     return res.status(404).send(expiredPage());
   }
 
-  if (downloadInProgress) {
-    log(`Download: busy, rejected ${link.fileName}`);
-    return res.status(503).send(busyPage());
+  if (activeDownloads.size >= MAX_CONCURRENT_DOWNLOADS) {
+    log(`Download: queue, ${link.fileName} — ${activeDownloads.size}/${MAX_CONCURRENT_DOWNLOADS} slots busy`);
+    return res.status(503).send(queuePage(link, req.params.token));
   }
-  downloadInProgress = true;
-  const release = () => { downloadInProgress = false; };
-  res.on('finish', release);
-  res.on('close', release);
 
-  log(`Download: start ${link.fileName} (${formatSize(link.fileSize)}) token=${req.params.token}`);
+  // Acquire a slot. Release is idempotent and fires on EVERY exit path:
+  // response finish, response close (client disconnect), stream error,
+  // upstream error, and the catch block below — plus the watchdog.
+  const slotId = ++downloadSeq;
+  const slot = {
+    id: slotId,
+    fileName: link.fileName,
+    fileSize: link.fileSize,
+    startedAt: Date.now(),
+    lastBytesAt: Date.now(),
+    bytesSent: 0,
+    res,
+    stream: null,
+  };
+  activeDownloads.set(slotId, slot);
+  log(`Download: slot ${slotId} acquired (${activeDownloads.size}/${MAX_CONCURRENT_DOWNLOADS}) ${link.fileName} (${formatSize(link.fileSize)}) token=${req.params.token}`);
+  let released = false;
+  const release = (reason) => {
+    if (released) return;
+    released = true;
+    activeDownloads.delete(slotId);
+    log(`Download: slot ${slotId} released (${reason}) ${link.fileName} — ${activeDownloads.size}/${MAX_CONCURRENT_DOWNLOADS} in use`);
+  };
+  const noteBytes = (n) => { slot.bytesSent += n; slot.lastBytesAt = Date.now(); };
+  res.on('finish', () => release('finished'));
+  res.on('close', () => release('client closed'));
 
   try {
     const tgFile = await getTelegramFile(link.fileId);
@@ -263,9 +410,12 @@ app.get('/dl/:token', async (req, res) => {
       // Stream it — never read it whole into memory.
       if (!fs.existsSync(filePath)) throw new Error(`Local file not found: ${filePath}`);
       const stream = fs.createReadStream(filePath, { highWaterMark: CHUNK_SIZE });
+      slot.stream = stream;
+      stream.on('data', (chunk) => noteBytes(chunk.length));
       stream.on('error', (err) => {
         log(`Download: local stream error ${err.message}`);
-        if (!res.headersSent) res.status(502).send(expiredPage());
+        release('local stream error');
+        if (!res.headersSent) res.status(502).send(failedPage(err));
         else res.destroy(err);
       });
       stream.pipe(res);
@@ -282,26 +432,19 @@ app.get('/dl/:token', async (req, res) => {
       res.setHeader('Content-Length', upstream.headers.get('content-length'));
     }
     const nodeStream = Readable.fromWeb(upstream.body);
+    slot.stream = nodeStream;
+    nodeStream.on('data', (chunk) => noteBytes(chunk.length));
     nodeStream.on('error', (err) => {
       log(`Download: upstream stream error ${err.message}`);
+      release('upstream stream error');
       res.destroy(err);
     });
     nodeStream.pipe(res);
   } catch (err) {
     log(`Download: FAILED ${link.fileName}: ${err.message}`);
+    release(`failed: ${err.message}`);
     if (!res.headersSent) {
-      res.status(502).send(pageHtml({
-        title: 'Download failed — Telegram Downloader Bot',
-        heading: '❌ Download failed',
-        lines: [
-          'Telegram la irundhu file ah edukka mudiyala. / Could not fetch the file from Telegram.',
-          `Reason: ${escapeHtml(err.message)}`,
-          'Periya file na (20 MB ku mela) Local Bot API server on la irukkanum. README paaru. / For big files (over 20 MB) the Local Bot API server must be on. See the README.',
-          'File ah bot ku thirumba anuppu, pudhu link try pannu. / Send the file to the bot again for a fresh link.',
-        ],
-        buttonText: 'Open Telegram Bot →',
-        buttonHref: BOT_USERNAME ? `https://t.me/${BOT_USERNAME}` : 'https://t.me/',
-      }));
+      res.status(502).send(failedPage(err));
     } else {
       res.destroy(err);
     }
@@ -320,7 +463,7 @@ const HELP_TEXT = [
   'Rules:',
   '• Link 24 hours ku appuram expire aayidum.',
   '• Size limit illa — Telegram max varaikum: free 2GB, Premium 4GB.',
-  '• 0 cost, slow ah irundhalum paravala, oru time la oru download.',
+  '• 0 cost, slow ah irundhalum paravala, oru time la 3 downloads varaikum.',
   '',
   '👋 Hello! I am the Telegram Downloader Bot.',
   '',
@@ -332,7 +475,7 @@ const HELP_TEXT = [
   'Rules:',
   '• The link expires after 24 hours.',
   '• No size limit — up to Telegram\'s max: free 2GB, Premium 4GB.',
-  '• Free, slow is fine, one download at a time.',
+  '• Free, slow is fine, up to 3 downloads at a time.',
 ].join('\n');
 
 let bot = null;
@@ -397,4 +540,4 @@ app.listen(PORT, () => {
   log(`Bot: ${bot ? 'polling ON' : 'OFF (no token)'}`);
 });
 
-module.exports = { app, createLink, links };
+module.exports = { app, createLink, links, activeDownloads, MAX_CONCURRENT_DOWNLOADS, pruneStaleDownloads };
